@@ -1,4 +1,4 @@
-# Read me first
+# About these samples
 
 This folder contains a few examples of my work written for different projects. Please note that code conventions 
 and style are different per file. They were written for different projects and companies with different conventions.
