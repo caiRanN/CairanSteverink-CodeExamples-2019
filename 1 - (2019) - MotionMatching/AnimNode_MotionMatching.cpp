@@ -121,17 +121,6 @@ void FAnimNode_MotionMatching::Evaluate_AnyThread(FPoseContext& Output)
 
 		EvaluateBlendPose(Output);
 
-#if WITH_EDITOR
-		const FTransform ActorTransform = Output.AnimInstanceProxy->GetActorTransform();
-		UE_LOG(LogTemp, Warning, TEXT("Actor Transform Location: %s"), *ActorTransform.GetLocation().ToString());
-		UE_LOG(LogTemp, Warning, TEXT("Actor Transform Forward: %s"), *ActorTransform.GetRotation().GetForwardVector().ToString());
-
-		for (const FTrajectoryPoint& Point : Goal.DesiredTrajectory)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("Point Location: %s"), *Point.Location.ToString());
-		}
-#endif//WITH_EDITOR
-
 		UpdateMotionMatching(Params, Output);
 	}
 }
@@ -214,11 +203,6 @@ void FAnimNode_MotionMatching::UpdateAnimationSampleData(const FAnimationUpdateC
 			SampleAnimTime += Context.GetDeltaTime();
 
 			SumWeight += SampleBlendWeight;
-
-#if WITH_EDITOR
-			/*UE_LOG(LogTemp, Warning, TEXT("Animation Sample ('%d') at time ('%f') has a weight of ('%f') and has remaining blend time of ('%f')"),
-				i, AnimationSamples[i].Time, AnimationSamples[i].BlendWeight, AnimationSamples[i].RemainingBlendTime);*/
-#endif//WITH_EDITOR
 		}
 
 		// Renormalize the weights
