@@ -4,6 +4,10 @@
 
 #include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
+#include "MotionMatchingUtilities.h"
+#include "MotionMatchingMetaData.h"
+#include "AnimNotifyState_MotionCategory.h"
+
 
 namespace FrameDataGlobals
 {
@@ -42,6 +46,7 @@ void FAnimationFrameData::ExtractAnimationData(const UAnimSequence* InAnimSequen
 		StartTime = InTime;
 		SourceAnimationIndex = InSourceIndex;
 
+		InitializeFromMetaData(InAnimSequence);
 		InitializeBoneDataFromAnimation(InAnimSequence, InTime, InBones);
 		InitializeTrajectoryData(InAnimSequence, InTime);
 
@@ -50,6 +55,50 @@ void FAnimationFrameData::ExtractAnimationData(const UAnimSequence* InAnimSequen
 		const FVector Velocity = TempVelocity.GetSafeNormal() * (TempVelocity.Size() / FrameDataGlobals::NextTimeDelta);
 
 		MotionVelocity = Velocity;
+	}
+}
+
+void FAnimationFrameData::InitializeFromMetaData(const UAnimSequence* InAnimSequence, const float InTime)
+{
+	if (InAnimSequence)
+	{
+		TArray<UAnimMetaData*> MetaData = InAnimSequence->GetMetaData();
+		
+		if (MetaData.Num() > 0)
+		{
+			for (const UAnimMetaData* Data : MetaData)
+			{
+				if (const UMotionMatchingMetaData* MotionMatchingData = Cast<UMotionMatchingMetaData>(Data))
+				{
+					Categories = MotionMatchingData->AnimationCategories;
+					Pose = MotionMatchingData->AnimationPose;
+				}
+			}
+		}
+	}
+
+	TArray<FAnimNotifyEventReference> OutNotifies;
+	InAnimSequence->GetAnimNotifiesFromDeltaPositions(InTime - FrameDataGlobals::PreviousTimeDelta, InTime, OutNotifies);
+
+	if (OutNotifies.Num() > 0)
+	{
+		for (const FAnimNotifyEventReference& Event : OutNotifies)
+		{
+			const UAnimNotifyState_MotionCategory* Category = Cast<UAnimNotifyState_MotionCategory>(Event.GetNotify());
+			if (Category)
+			{
+				TArray<FGameplayTag> OutTags;
+				Category->Categories.GetGameplayTagArray(OutTags);
+
+				if (OutTags.Num() > 0)
+				{
+					for (FGameplayTag& Tag : OutTags)
+					{
+						Categories.AddTag(Tag);
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -96,10 +145,12 @@ void FAnimationFrameData::InitializeTrajectoryData(const UAnimSequence* InAnimSe
 	{
 		MotionTrajectory.Empty();
 
-		for (const float& TimeDelay : FrameDataGlobals::TimeDelays)
+		AnimationTransform = InAnimSequence->ExtractRootMotion(InTime, 0.0f, true);
+
+		for (const float& TimeDelay : FMotionMatchingUtils::TrajectoryIntervals)
 		{
-			FVector Location = InAnimSequence->ExtractRootMotion(InTime, TimeDelay, true).GetTranslation();
-			MotionTrajectory.Add(FTrajectoryPoint(Location, TimeDelay));
+			FTransform RootMotionTM = InAnimSequence->ExtractRootMotion(InTime, TimeDelay, true);
+			MotionTrajectory.Add(FTrajectoryPoint(RootMotionTM.GetTranslation(), RootMotionTM.GetRotation(), TimeDelay));
 		}
 	}
 }
