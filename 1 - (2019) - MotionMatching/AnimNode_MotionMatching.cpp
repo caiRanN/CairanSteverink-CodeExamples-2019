@@ -10,24 +10,16 @@
 #include "Animation/AnimSequenceBase.h"
 #include "Animation/Skeleton.h"
 
+#include "AnimationRuntime.h"
+
 #include "AnimationDatabase.h"
 #include "Goal.h"
 
-
-FAnimNode_MotionMatching::FAnimNode_MotionMatching()
-	: AnimationDatabase(nullptr)
-	, Goal(FGoal())
-	, Responsiveness(0.5f)
-	, BlendTime(0.2f)
-	, bEnablePoseMatching(true)
-{
-}
-
 float FAnimNode_MotionMatching::GetCurrentAssetTime()
 {
-	if (CurrentAnimation.IsValid())
+	if (AnimationSamples.Num() > 0)
 	{
-		return CurrentAnimation.Time;
+		AnimationSamples.Last().Time;
 	}
 
 	// No sample
@@ -41,7 +33,7 @@ float FAnimNode_MotionMatching::GetCurrentAssetTimePlayRateAdjusted()
 
 float FAnimNode_MotionMatching::GetCurrentAssetLength()
 {
-	return GetCurrentAnimationAsset() ? GetCurrentAnimationAsset()->SequenceLength : 0.0f;
+	return GetCurrentAnim() != NULL ? GetCurrentAnim()->SequenceLength : 0.0f;
 }
 
 void FAnimNode_MotionMatching::Initialize_AnyThread(const FAnimationInitializeContext& Context)
@@ -52,6 +44,25 @@ void FAnimNode_MotionMatching::Initialize_AnyThread(const FAnimationInitializeCo
 
 	InternalTimeAccumulator = 0.0f;
 
+	const int NumPoses = AnimationSamples.Num();
+	
+	if (NumPoses > 0)
+	{
+		FMotionMatchingSampleData& Data = AnimationSamples.Last();
+		Data.BlendWeight = 1.0f;
+		SamplesToEvaluate.Add(Data);
+
+		LastActiveChildSample = NULL;
+
+		for (int32 i = 0; i < AnimationSamples.Num(); ++i)
+		{
+			FAlphaBlend& Blend = AnimationSamples[i].Blend;
+			Blend.SetBlendTime(0.0f);
+			Blend.SetBlendOption(BlendType);
+			Blend.SetCustomCurve(CustomBlendCurve);
+		}
+		AnimationSamples.Last().Blend.SetAlpha(1.0f);
+	}
 }
 
 void FAnimNode_MotionMatching::CacheBones_AnyThread(const FAnimationCacheBonesContext& Context)
@@ -64,14 +75,17 @@ void FAnimNode_MotionMatching::UpdateAssetPlayer(const FAnimationUpdateContext& 
 
 	if (AnimationDatabase)
 	{
-		if (GetCurrentAnimationAsset() != nullptr && Context.AnimInstanceProxy->IsSkeletonCompatible(GetCurrentAnimationAsset()->GetSkeleton()))
+		UpdateAnimationSampleData(Context);
+
+		if (AnimationSamples.Num() > 0 && GetCurrentAnim() != NULL 
+			&& Context.AnimInstanceProxy->IsSkeletonCompatible(GetCurrentAnim()->GetSkeleton()))
 		{
-			InternalTimeAccumulator = FMath::Clamp(InternalTimeAccumulator, 0.0f, GetCurrentAnimationAsset()->SequenceLength);
-			
+			InternalTimeAccumulator = FMath::Clamp(InternalTimeAccumulator, 0.0f, GetCurrentAnim()->SequenceLength);
+
 			const float PlayRate = 1.0f;
 			const float bLooping = true;
-			
-			CreateTickRecordForNode(Context, GetCurrentAnimationAsset(), bLooping, PlayRate);
+
+			CreateTickRecordForNode(Context, GetCurrentAnim(), bLooping, PlayRate);
 		}
 	}
 }
@@ -82,60 +96,204 @@ void FAnimNode_MotionMatching::Evaluate_AnyThread(FPoseContext& Output)
 	{
 		FVector Velocity = FVector::ZeroVector;
 		TArray<FMotionBoneData> CurrentBonesData;
+		bool bHasCurrentAnim = false;
 
-		if (CurrentAnimation.IsValid())
+		if (AnimationSamples.Num() > 0)
 		{
 			// Calculate our current velocity from the animation
-			//const FVector TempVelocity = CurrentAnimation.Animation->ExtractRootMotion(CurrentAnimation.Time, 0.1f /* DeltaTime */, true).GetTranslation();
-			const FVector TempVelocity = CurrentAnimation.Animation->ExtractRootMotion(InternalTimeAccumulator, 0.1f /* DeltaTime */, true).GetTranslation();
+			const FVector TempVelocity = GetCurrentAnim()->ExtractRootMotion(AnimationSamples.Last().Time, 0.1f /* DeltaTime */, true).GetTranslation();
 			Velocity = TempVelocity.GetSafeNormal() * (TempVelocity.Size() / 0.1f /* DeltaTime */);
 
 			// Get data about our current bones
-			//CurrentBonesData = UMotionMatchingUtilities::GetBoneDataFromAnimation(CurrentAnimation.Animation, CurrentAnimation.Time, AnimationDatabase->GetMotionMatchingBones());
-			CurrentBonesData = UMotionMatchingUtilities::GetBoneDataFromAnimation(CurrentAnimation.Animation, InternalTimeAccumulator, AnimationDatabase->GetMotionMatchingBones());
+			CurrentBonesData = UMotionMatchingUtilities::GetBoneDataFromAnimation(GetCurrentAnim(), AnimationSamples.Last().Time, AnimationDatabase->GetMotionMatchingBones());
+			bHasCurrentAnim = true;
 		}
 
 		FMotionMatchingParams Params;
 		Params.Responsiveness = Responsiveness;
 		Params.BlendTime = BlendTime;
 		Params.bPoseMatching = bEnablePoseMatching;
-		Params.bHasCurrentAnimation = CurrentAnimation.IsValid();
 		Params.CurrentVelocity = Velocity;
+		Params.bHasCurrentAnimation = bHasCurrentAnim;
 		Params.CurrentBonesData = CurrentBonesData;
+		Params.TrajectoryPositionAxis = TrajectoryPositionAxis;
+		Params.BonePositionAxis = BonePositionAxis;
 
-		if (GetCurrentAnimationAsset() && Output.AnimInstanceProxy->IsSkeletonCompatible(GetCurrentAnimationAsset()->GetSkeleton()))
-		{
-			CurrentAnimation.Animation->GetAnimationPose(Output.Pose, Output.Curve, FAnimExtractContext(InternalTimeAccumulator, true));
-			//CurrentAnimation.Animation->GetAnimationPose(Output.Pose, Output.Curve, FAnimExtractContext(CurrentAnimation.Time, true)); // @todo: we need to increment time
-		}
-		else
-		{
-			Output.ResetToRefPose();
-		}
+		EvaluateBlendPose(Output);
 
-		UpdateMotionMatching(Params);
+#if WITH_EDITOR
+		const FTransform ActorTransform = Output.AnimInstanceProxy->GetActorTransform();
+		UE_LOG(LogTemp, Warning, TEXT("Actor Transform Location: %s"), *ActorTransform.GetLocation().ToString());
+		UE_LOG(LogTemp, Warning, TEXT("Actor Transform Forward: %s"), *ActorTransform.GetRotation().GetForwardVector().ToString());
+
+		for (const FTrajectoryPoint& Point : Goal.DesiredTrajectory)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Point Location: %s"), *Point.Location.ToString());
+		}
+#endif//WITH_EDITOR
+
+		UpdateMotionMatching(Params, Output);
 	}
 }
 
 void FAnimNode_MotionMatching::GatherDebugData(FNodeDebugData& DebugData)
 {
 	FString DebugLine = DebugData.GetNodeName(this);
-	if (CurrentAnimation.IsValid())
+	if (LastActiveChildSample.IsValid())
 	{
-		DebugLine += FString::Printf(TEXT("('%s' Play Time: %.3f)"), *CurrentAnimation.Animation->GetName(), InternalTimeAccumulator);
+		DebugLine += FString::Printf(TEXT("('%s' Play Time: %.3f)"), *LastActiveChildSample.Animation->GetName(), LastActiveChildSample.Time);
 		DebugData.AddDebugItem(DebugLine, true);
 	}
 }
 
-void FAnimNode_MotionMatching::UpdateInternal(const FAnimationUpdateContext& Context)
+void FAnimNode_MotionMatching::UpdateAnimationSampleData(const FAnimationUpdateContext& Context)
 {
-	if ((GetCurrentAnimationAsset() != NULL) && (Context.AnimInstanceProxy->IsSkeletonCompatible(GetCurrentAnimationAsset()->GetSkeleton())))
-	{
+	const int NumPoses = AnimationSamples.Num();
 
+	SamplesToEvaluate.Empty(NumPoses);
+
+	if (NumPoses > 0)
+	{
+		// Handle a change in the active child index; adjusting the target weights
+		FMotionMatchingSampleData& ChildSample = AnimationSamples.Last();
+
+		if (ChildSample != LastActiveChildSample)
+		{
+			bool bLastChildSampleIsInvalid = !LastActiveChildSample.IsValid();
+
+			const float CurrentWeight = ChildSample.BlendWeight;
+			const float DesiredWeight = 1.0f;
+			const float WeightDifference = FMath::Clamp<float>(FMath::Abs<float>(DesiredWeight - CurrentWeight), 0.0f, 1.0f);
+
+			// scale by the weight difference since we want always consistency:
+			// - if you're moving from 0 to full weight 1, it will use the normal blend time
+			// - if you're moving from 0.5 to full weight 1, it will get there in half the time
+			const float RemainingBlendTime = bLastChildSampleIsInvalid ? 0.0f : (ChildSample.BlendTime * WeightDifference);
+
+			for (int32 i = 0; i < AnimationSamples.Num(); ++i)
+			{
+				AnimationSamples[i].RemainingBlendTime = RemainingBlendTime;
+			}
+
+			// If we have a valid previous child and we're instantly blending - update that pose with zero weight
+			if (RemainingBlendTime == 0.0f && !bLastChildSampleIsInvalid)
+			{
+				LastActiveChildSample.BlendWeight = 0.0f;
+			}
+
+			for (int32 i = 0; i < AnimationSamples.Num(); ++i)
+			{
+				FAlphaBlend& Blend = AnimationSamples[i].Blend;
+				Blend.SetBlendTime(RemainingBlendTime);
+
+				if (AnimationSamples[i] == ChildSample)
+				{
+					Blend.SetValueRange(AnimationSamples[i].BlendWeight, 1.0f);
+				}
+				else
+				{
+					Blend.SetValueRange(AnimationSamples[i].BlendWeight, 0.0f);
+				}
+			}
+
+			// Assign the sample as the previous
+			LastActiveChildSample = ChildSample;
+		}
+
+		// Advance the weights and times
+		float SumWeight = 0.0f;
+		for (int32 i = 0; i < AnimationSamples.Num(); ++i)
+		{
+			float& SampleBlendWeight = AnimationSamples[i].BlendWeight;
+			float& SampleAnimTime = AnimationSamples[i].Time;
+
+			FAlphaBlend& Blend = AnimationSamples[i].Blend;
+			Blend.Update(Context.GetDeltaTime());
+			SampleBlendWeight = Blend.GetBlendedValue();
+
+			SampleAnimTime += Context.GetDeltaTime();
+
+			SumWeight += SampleBlendWeight;
+
+#if WITH_EDITOR
+			/*UE_LOG(LogTemp, Warning, TEXT("Animation Sample ('%d') at time ('%f') has a weight of ('%f') and has remaining blend time of ('%f')"),
+				i, AnimationSamples[i].Time, AnimationSamples[i].BlendWeight, AnimationSamples[i].RemainingBlendTime);*/
+#endif//WITH_EDITOR
+		}
+
+		// Renormalize the weights
+		if ((SumWeight > ZERO_ANIMWEIGHT_THRESH) && (FMath::Abs<float>(SumWeight - 1.0f) > ZERO_ANIMWEIGHT_THRESH))
+		{
+			float ReciprocalSum = 1.0f / SumWeight;
+			for (int32 i = 0; i < AnimationSamples.Num(); ++i)
+			{
+				float& SampleBlendWeight = AnimationSamples[i].BlendWeight;
+				SampleBlendWeight *= ReciprocalSum;
+			}
+		}
+
+		// Update our active children
+		for (int32 i = 0; i < AnimationSamples.Num(); ++i)
+		{
+			const float SampleBlendWeight = AnimationSamples[i].BlendWeight;
+			if (SampleBlendWeight > ZERO_ANIMWEIGHT_THRESH)
+			{
+				SamplesToEvaluate.Add(AnimationSamples[i]);
+			}
+		}
+
+		// Remove our inactive samples
+		for (int32 i = (AnimationSamples.Num() - 1); i > 0; --i)
+		{
+			const float SampleBlendWeight = AnimationSamples[i].BlendWeight;
+			if (SampleBlendWeight <= ZERO_ANIMWEIGHT_THRESH)
+			{
+				AnimationSamples.RemoveAt(i);
+			}
+		}
 	}
 }
 
-void FAnimNode_MotionMatching::UpdateMotionMatching(const FMotionMatchingParams& MotionMatchingParams)
+void FAnimNode_MotionMatching::EvaluateBlendPose(FPoseContext& Output)
+{
+	ANIM_MT_SCOPE_CYCLE_COUNTER(BlendPosesInGraph, !IsInGameThread());
+
+	const int32 NumPoses = SamplesToEvaluate.Num();
+
+	if (NumPoses > 0)
+	{
+		TArray<FCompactPose, TInlineAllocator<8>> FilteredPoses;
+		FilteredPoses.SetNum(NumPoses, false);
+		
+		TArray<FBlendedCurve, TInlineAllocator<8>> FilteredCurves;
+		FilteredCurves.SetNum(NumPoses, false);
+
+		TArray<float, TInlineAllocator<8>> FilteredWeights;
+		FilteredWeights.SetNum(NumPoses, false);
+
+		float SumWeight = 0.0f;
+		for (int32 i = 0; i < SamplesToEvaluate.Num(); ++i)
+		{
+			FMotionMatchingSampleData& Sample = SamplesToEvaluate[i];
+
+			FilteredPoses[i].CopyBonesFrom(Output.Pose);
+			FilteredCurves[i].InitFrom(Output.Curve);
+			FilteredWeights[i] = Sample.BlendWeight;
+
+			Sample.Animation->GetAnimationPose(FilteredPoses[i], FilteredCurves[i], FAnimExtractContext(Sample.Time, true));
+
+			SumWeight += Sample.BlendWeight;
+		}
+
+		FAnimationRuntime::BlendPosesTogether(FilteredPoses, FilteredCurves, FilteredWeights, Output.Pose, Output.Curve);
+	}
+	else
+	{
+		Output.ResetToRefPose();
+	}
+}
+
+void FAnimNode_MotionMatching::UpdateMotionMatching(const FMotionMatchingParams& MotionMatchingParams, const FPoseContext& Output)
 {
 	if (AnimationDatabase)
 	{
@@ -144,29 +302,23 @@ void FAnimNode_MotionMatching::UpdateMotionMatching(const FMotionMatchingParams&
 
 		UMotionMatchingUtilities::GetLowestCostAnimation(AnimationDatabase, Goal, MotionMatchingParams, WinnerIndex, WinnerCost);
 
-		// Check if the Winner Index is the Same as our current animation
 		if (WinnerIndex != INDEX_NONE)
 		{
 			FAnimationFrameData Winner = AnimationDatabase->GetMotionFrameData()[WinnerIndex];
 
-			if (CurrentAnimation.IsValid())
+			if (AnimationSamples.Num() > 0)
 			{
-				//bool bTheWinnerIsAtTheSameLocation = (Winner.SourceAnimationIndex == CurrentAnimation.AnimationIndex) && (FMath::Abs(Winner.StartTime - CurrentAnimation.Time) < 0.2f);
-				bool bTheWinnerIsAtTheSameLocation = (Winner.SourceAnimationIndex == CurrentAnimation.AnimationIndex) && (FMath::Abs(Winner.StartTime - InternalTimeAccumulator) < 0.2f);
-
+				bool bTheWinnerIsAtTheSameLocation = (Winner.SourceAnimationIndex == AnimationSamples.Last().AnimationIndex)
+														&& (FMath::Abs(Winner.StartTime - AnimationSamples.Last().Time) < 0.2f);
+				
 				if (!bTheWinnerIsAtTheSameLocation)
 				{
+					// Play Anim with Blend
 					SetCurrentAnimation(Winner.SourceAnimationIndex, Winner.StartTime);
 
 					// Update our time accumulator to start at the new time
 					InternalTimeAccumulator = Winner.StartTime;
-
-					//UE_LOG(LogTemp, Warning, TEXT("Winner with index ('%d') playing animation at time ('%f') with a cost of ('%f')"), WinnerIndex, Winner.StartTime, WinnerCost);
 				}
-				else
-				{
-					//UE_LOG(LogTemp, Warning, TEXT("Winner with index ('%d') is at the same location at time ('%f') with a cost of ('%f')"), WinnerIndex, Winner.StartTime, WinnerCost);
-				}	
 			}
 			else
 			{
@@ -181,14 +333,26 @@ void FAnimNode_MotionMatching::SetCurrentAnimation(const int InAnimationIndex, c
 	FMotionMatchingSampleData NewAnimation;
 	NewAnimation.AnimationIndex = InAnimationIndex;
 	NewAnimation.Animation = AnimationDatabase->GetSourceAnimations()[InAnimationIndex];
+	NewAnimation.BlendTime = BlendTime;
+	NewAnimation.RemainingBlendTime = BlendTime;
+	NewAnimation.BlendWeight = 0.0f;
 	NewAnimation.Time = InTime;
 
-	PreviousAnimation = CurrentAnimation;
-	CurrentAnimation = NewAnimation;
+	FAlphaBlend& Blend = NewAnimation.Blend;
+	Blend.SetBlendTime(0.0f);
+	Blend.SetBlendOption(BlendType);
+	Blend.SetCustomCurve(CustomBlendCurve);
+
+	AnimationSamples.Add(NewAnimation);
 }
 
-UAnimSequence* FAnimNode_MotionMatching::GetCurrentAnimationAsset() const
+UAnimSequence* FAnimNode_MotionMatching::GetCurrentAnim()
 {
-	return CurrentAnimation.Animation;
+	if (AnimationSamples.Num() > 0)
+	{
+		return AnimationSamples.Last().Animation;
+	}
+
+	return NULL;
 }
 
